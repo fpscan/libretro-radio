@@ -16,39 +16,70 @@ endif
 
 TARGET_NAME := radio
 
+LIBMAD_DIR := deps/libretro-deps/libmad
+
+LIBMAD_SRCS := \
+   $(LIBMAD_DIR)/bit.c \
+   $(LIBMAD_DIR)/decoder.c \
+   $(LIBMAD_DIR)/fixed.c \
+   $(LIBMAD_DIR)/frame.c \
+   $(LIBMAD_DIR)/huffman.c \
+   $(LIBMAD_DIR)/layer12.c \
+   $(LIBMAD_DIR)/layer3.c \
+   $(LIBMAD_DIR)/stream.c \
+   $(LIBMAD_DIR)/synth.c \
+   $(LIBMAD_DIR)/timer.c
+
+LIBMAD_OBJS := $(patsubst $(LIBMAD_DIR)/%.c,libmad_%.o,$(LIBMAD_SRCS))
+
 ifeq ($(platform), unix)
    TARGET := $(TARGET_NAME)_libretro.so
    fpic := -fPIC
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined
    LIBS += -lm -lpthread
+   FPM_DEFINE := -DFPM_64BIT
 else ifeq ($(platform), osx)
    TARGET := $(TARGET_NAME)_libretro.dylib
    fpic := -fPIC
    SHARED := -dynamiclib
    LIBS += -lm -lpthread
+   FPM_DEFINE := -DFPM_64BIT
 else
    TARGET := $(TARGET_NAME)_libretro.dll
    SHARED := -shared -static-libgcc -static-libstdc++
    LIBS += -lm -lws2_32 -lwinmm
+   FPM_DEFINE := -DFPM_64BIT
 endif
 
 CC ?= gcc
-CFLAGS += -O3 -Wall $(fpic) -I../../libretro-common/include -I../../deps/dr -D__LIBRETRO__
 
-# Compile with fast math for visualizer if possible
+LIBRETRO_COMMON_INC := deps/include
+
+LIBMAD_CFLAGS := -O3 $(fpic) -I$(LIBMAD_DIR) -I$(LIBRETRO_COMMON_INC) \
+   $(FPM_DEFINE) \
+   -DHAVE_CONFIG_H=0 \
+   -Wno-unused-function \
+   -Wno-sign-compare \
+   -Wno-shift-negative-value
+
+CFLAGS += -O3 -Wall $(fpic) -I. -I../../libretro-common/include -I$(LIBMAD_DIR) -D__LIBRETRO__ $(FPM_DEFINE)
+
 CFLAGS += -ffast-math
 
-OBJS := libretro-radio.o
+OBJS := libretro-radio.o $(LIBMAD_OBJS)
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) -o $@ $^ $(SHARED) $(LIBS)
 
-%.o: %.c
+libretro-radio.o: libretro-radio.c
 	$(CC) -c -o $@ $< $(CFLAGS)
 
+libmad_%.o: $(LIBMAD_DIR)/%.c
+	$(CC) -c -o $@ $< $(LIBMAD_CFLAGS)
+
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f libretro-radio.o $(LIBMAD_OBJS) $(TARGET)
 
 .PHONY: all clean

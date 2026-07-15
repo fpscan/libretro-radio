@@ -1,0 +1,4 @@
+[submodule "deps/libretro-deps"]
+	path = deps/libretro-deps
+	url = https://github.com/libretro/libretro-deps.git
+	sparseCheckout = true

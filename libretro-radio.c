@@ -25,8 +25,7 @@
 
 #include <libretro.h>
 
-#define DR_MP3_IMPLEMENTATION
-#include <dr_mp3.h>
+#include "mad.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -42,7 +41,8 @@ enum core_status_t {
    STATUS_CONNECTING,
    STATUS_BUFFERING,
    STATUS_PLAYING,
-   STATUS_ERROR
+   STATUS_ERROR,
+   STATUS_EOF
 };
 
 
@@ -59,6 +59,28 @@ typedef struct {
    size_t read_ptr;
    pthread_mutex_t mutex;
 } ring_buffer_t;
+
+typedef enum {
+    PLAYBACK_RADIO = 0,
+    PLAYBACK_FILE_MP3,
+    PLAYBACK_FILE_WAV,
+} playback_mode_t;
+static playback_mode_t playback_mode = PLAYBACK_RADIO;
+
+static char     file_path[1024] = "";
+static char     file_display_name[256] = "";
+static uint64_t file_total_bytes = 0;
+static uint64_t file_bytes_read  = 0;
+static uint32_t wav_sample_rate  = 44100;
+static uint8_t  wav_channels     = 2;
+static uint8_t  wav_bits         = 16;
+static bool     file_seek_requested = false;
+static uint64_t file_seek_target_bytes = 0;
+static uint32_t mp3_bitrate_bps = 128000;
+static uint32_t mp3_sample_rate = 44100;
+static uint64_t pcm_samples_played = 0;
+static uint64_t mp3_total_seconds = 0;
+static volatile bool wav_rate_changed = false;
 
 
 static const uint8_t font_8x8[96][8] = {
@@ -181,8 +203,19 @@ static int visualizer_mode = 0;
 static uint32_t time_counter = 0;
 
 static ring_buffer_t rb;
-static drmp3 mp3_decoder;
-static bool drmp3_initialized = false;
+
+static struct mad_stream mad_stream_state;
+static struct mad_frame  mad_frame_state;
+static struct mad_synth  mad_synth_state;
+static bool mad_initialized = false;
+
+#define MAD_INPUT_BUF_SIZE    40960
+#define MAD_MAX_FRAME_SAMPLES 1152
+#define MAD_PCM_QUEUE_MAX     ((MAD_MAX_FRAME_SAMPLES * 2) * 8)
+
+static uint8_t  mad_input_buf[MAD_INPUT_BUF_SIZE];
+static int16_t  mad_pcm_queue[MAD_PCM_QUEUE_MAX];
+static size_t   mad_pcm_queue_len = 0;
 
 static pthread_t conn_thread;
 static volatile bool cancel_thread = false;
@@ -425,20 +458,14 @@ static const char *find_header_case_insensitive(const char *headers, const char 
 }
 
 
-static size_t drmp3_read_cb(void *pUserData, void *pBuffer, size_t bytesToRead) {
-   ring_buffer_t *r = (ring_buffer_t *)pUserData;
-   size_t read_bytes = 0;
-
-   pthread_mutex_lock(&r->mutex);
-   size_t avail = ring_buffer_read_avail(r);
-   if (avail > 0) {
-      size_t to_read = (bytesToRead < avail) ? bytesToRead : avail;
-      ring_buffer_read(r, (uint8_t *)pBuffer, to_read);
-      read_bytes = to_read;
+static void mad_reset_decoder(void) {
+   if (mad_initialized) {
+      mad_synth_finish(&mad_synth_state);
+      mad_frame_finish(&mad_frame_state);
+      mad_stream_finish(&mad_stream_state);
+      mad_initialized = false;
    }
-   pthread_mutex_unlock(&r->mutex);
-
-   return read_bytes;
+   mad_pcm_queue_len = 0;
 }
 
 
@@ -612,6 +639,160 @@ static void *connection_thread_func(void *arg) {
    return NULL;
 }
 
+static void stop_current_thread(void); // Forward declaration
+
+static bool parse_wav_header(FILE *f) {
+   uint8_t riff[12];
+   if (fread(riff, 1, 12, f) != 12) return false;
+   if (memcmp(riff, "RIFF", 4) != 0 || memcmp(riff+8, "WAVE", 4) != 0) return false;
+   
+   bool fmt_found = false;
+   bool data_found = false;
+   
+   while (!data_found) {
+      uint8_t chunk_header[8];
+      if (fread(chunk_header, 1, 8, f) != 8) break;
+      uint32_t chunk_size = chunk_header[4] | (chunk_header[5] << 8) | (chunk_header[6] << 16) | (chunk_header[7] << 24);
+      
+      if (memcmp(chunk_header, "fmt ", 4) == 0) {
+         uint8_t fmt_data[16];
+         size_t read_len = (chunk_size < 16) ? chunk_size : 16;
+         if (fread(fmt_data, 1, read_len, f) != read_len) return false;
+         
+         uint16_t audio_format = fmt_data[0] | (fmt_data[1] << 8);
+         wav_channels = fmt_data[2] | (fmt_data[3] << 8);
+         wav_sample_rate = fmt_data[4] | (fmt_data[5] << 8) | (fmt_data[6] << 16) | (fmt_data[7] << 24);
+         wav_bits = fmt_data[14] | (fmt_data[15] << 8);
+         
+         if (audio_format != 1) return false; // Only PCM
+         if (chunk_size > 16) {
+             fseek(f, chunk_size - 16, SEEK_CUR);
+         }
+         fmt_found = true;
+      } else if (memcmp(chunk_header, "data", 4) == 0) {
+         file_total_bytes = chunk_size;
+         data_found = true;
+      } else {
+         fseek(f, chunk_size, SEEK_CUR);
+      }
+   }
+   
+   return fmt_found && data_found;
+}
+
+static void *file_reader_thread_func(void *arg) {
+   FILE *f = fopen(file_path, "rb");
+   if (!f) {
+      core_status = STATUS_ERROR;
+      return NULL;
+   }
+
+   if (playback_mode == PLAYBACK_FILE_WAV) {
+      if (!parse_wav_header(f)) {
+         fclose(f);
+         core_status = STATUS_ERROR;
+         return NULL;
+      }
+      wav_rate_changed = true;
+   } else {
+      fseek(f, 0, SEEK_END);
+      file_total_bytes = ftell(f);
+      rewind(f);
+   }
+
+   core_status = STATUS_BUFFERING;
+   uint8_t temp_buf[4096];
+   long data_start_offset = ftell(f);
+
+   while (!cancel_thread) {
+      if (file_seek_requested) {
+         long target_offset = data_start_offset + file_seek_target_bytes;
+         if (target_offset > data_start_offset + (long)file_total_bytes) {
+            target_offset = data_start_offset + (long)file_total_bytes;
+         }
+         fseek(f, target_offset, SEEK_SET);
+         file_bytes_read = target_offset - data_start_offset;
+         file_seek_requested = false;
+      }
+
+      pthread_mutex_lock(&rb.mutex);
+      size_t space = ring_buffer_write_space(&rb);
+      pthread_mutex_unlock(&rb.mutex);
+
+      if (space < 4096) {
+         usleep(8000);
+         continue;
+      }
+
+      size_t to_read = 4096;
+      if (file_bytes_read + to_read > file_total_bytes) {
+          to_read = file_total_bytes - file_bytes_read;
+      }
+
+      if (to_read == 0) {
+          break; // EOF reached
+      }
+
+      size_t r = fread(temp_buf, 1, to_read, f);
+      if (r == 0) {
+         break;
+      }
+
+      file_bytes_read += r;
+
+      pthread_mutex_lock(&rb.mutex);
+      ring_buffer_write(&rb, temp_buf, r);
+      pthread_mutex_unlock(&rb.mutex);
+   }
+
+   fclose(f);
+
+   if (!cancel_thread) {
+      core_status = STATUS_EOF;
+   }
+
+   return NULL;
+}
+
+static void start_file_thread(const char *path) {
+   stop_current_thread();
+   cancel_thread = false;
+   
+   strncpy(file_path, path, sizeof(file_path) - 1);
+   file_path[sizeof(file_path) - 1] = '\0';
+   
+   const char *base = strrchr(file_path, '/');
+   if (!base) base = strrchr(file_path, '\\');
+   if (base) base++; else base = file_path;
+   
+   strncpy(file_display_name, base, sizeof(file_display_name) - 1);
+   file_display_name[sizeof(file_display_name) - 1] = '\0';
+
+   const char *ext = strrchr(file_path, '.');
+   if (ext && strcasecmp(ext, ".wav") == 0) {
+       playback_mode = PLAYBACK_FILE_WAV;
+   } else {
+       playback_mode = PLAYBACK_FILE_MP3;
+   }
+   
+   file_bytes_read = 0;
+   file_total_bytes = 0;
+   file_seek_requested = false;
+   file_seek_target_bytes = 0;
+   mp3_bitrate_bps = 128000;
+   mp3_sample_rate = 44100;
+   pcm_samples_played = 0;
+   mp3_total_seconds = 0;
+
+   core_status = STATUS_CONNECTING;
+
+   if (pthread_create(&conn_thread, NULL, file_reader_thread_func, NULL) == 0) {
+      thread_active = true;
+   } else {
+      core_status = STATUS_ERROR;
+   }
+}
+
 static void stop_current_thread(void) {
    if (thread_active) {
       cancel_thread = true;
@@ -622,14 +803,12 @@ static void stop_current_thread(void) {
       pthread_join(conn_thread, NULL);
       thread_active = false;
    }
-   if (drmp3_initialized) {
-      drmp3_uninit(&mp3_decoder);
-      drmp3_initialized = false;
-   }
+   mad_reset_decoder();
    pthread_mutex_lock(&rb.mutex);
    ring_buffer_clear(&rb);
    pthread_mutex_unlock(&rb.mutex);
-
+   playback_mode = PLAYBACK_RADIO;
+   pcm_samples_played = 0;
    core_status = STATUS_IDLE;
 }
 
@@ -649,8 +828,17 @@ static void start_connection_thread(const char *url) {
    }
 }
 
+static void play_current_station(void) {
+   const char *url = stations[current_station_idx].url;
+   if (strncmp(url, "http://", 7) == 0 || strncmp(url, "https://", 8) == 0) {
+      start_connection_thread(url);
+   } else {
+      start_file_thread(url);
+   }
+}
+
 static void reconnect_current_station(void) {
-   start_connection_thread(stations[current_station_idx].url);
+   play_current_station();
 }
 
 static void pause_current_station(void) {
@@ -658,8 +846,10 @@ static void pause_current_station(void) {
 }
 
 static void change_station(int dir) {
-   current_station_idx = (current_station_idx + dir + num_stations) % num_stations;
-   start_connection_thread(stations[current_station_idx].url);
+   if (num_stations > 1) {
+      current_station_idx = (current_station_idx + dir + num_stations) % num_stations;
+      play_current_station();
+   }
 }
 
 static void check_variables(void) {
@@ -675,7 +865,7 @@ static void check_variables(void) {
                fprintf(stderr, "[Radio] Station preset changed via options to Preset %d (Idx: %d)\n", sel_idx, target_idx);
                last_option_station_idx = target_idx;
                current_station_idx = target_idx;
-               start_connection_thread(stations[current_station_idx].url);
+               play_current_station();
             }
          }
       }
@@ -957,51 +1147,98 @@ static void render_frame(uint32_t *fb, int width, int height) {
 
       draw_line(fb, width, height, 30, 145, width - 30, 145, theme->border);
 
-      draw_line(fb, width, height, 50, 95, width - 50, 95, theme->border);
-      for (float f = 88.0f; f <= 108.0f; f += 0.2f) {
-         int x = 50 + (int)((f - 88.0f) * 27.0f);
-         int tick_h = 5;
-         uint32_t t_color = theme->text_secondary;
-         if (fmodf(f, 1.0f) < 0.01f || fmodf(f, 1.0f) > 0.99f) {
-            tick_h = 10;
-            t_color = theme->text_primary;
-            char label[16];
-            sprintf(label, "%.0f", f);
-            draw_string(fb, width, height, label, x - 4, 105, theme->text_secondary);
+      if (playback_mode == PLAYBACK_RADIO) {
+         draw_line(fb, width, height, 50, 95, width - 50, 95, theme->border);
+         for (float f = 88.0f; f <= 108.0f; f += 0.2f) {
+            int x = 50 + (int)((f - 88.0f) * 27.0f);
+            int tick_h = 5;
+            uint32_t t_color = theme->text_secondary;
+            if (fmodf(f, 1.0f) < 0.01f || fmodf(f, 1.0f) > 0.99f) {
+               tick_h = 10;
+               t_color = theme->text_primary;
+               char label[16];
+               sprintf(label, "%.0f", f);
+               draw_string(fb, width, height, label, x - 4, 105, theme->text_secondary);
+            }
+            draw_line(fb, width, height, x, 95 - tick_h, x, 95, t_color);
          }
-         draw_line(fb, width, height, x, 95 - tick_h, x, 95, t_color);
+
+         float target_freq = stations[current_station_idx].frequency;
+         static float current_freq_pos = 98.0f;
+         current_freq_pos += (target_freq - current_freq_pos) * 0.08f;
+
+         int needle_x = 50 + (int)((current_freq_pos - 88.0f) * 27.0f);
+         draw_line(fb, width, height, needle_x, 75, needle_x, 98, 0xFF3333);
+         draw_line(fb, width, height, needle_x - 1, 75, needle_x - 1, 98, 0xFF3333);
+         draw_line(fb, width, height, needle_x + 1, 75, needle_x + 1, 98, 0xFF3333);
+         draw_rect(fb, width, height, needle_x - 2, 99, 5, 2, 0xFF5555);
+
+         char title_str[64];
+         sprintf(title_str, "RADIO PRESET %d/%d", current_station_idx + 1, num_stations);
+         draw_string_with_shadow(fb, width, height, title_str, 40, 35, theme->text_secondary, 0x000000);
+
+         draw_string_with_shadow(fb, width, height, stations[current_station_idx].name, 40, 50, theme->text_primary, 0x000000);
+
+         char freq_str[32];
+         sprintf(freq_str, "%.1f FM MHz", stations[current_station_idx].frequency);
+         draw_string_with_shadow(fb, width, height, freq_str, width - 150, 35, theme->dial_accent, 0x000000);
+
+         char url_display[80];
+         snprintf(url_display, sizeof(url_display), "URL: %s", stations[current_station_idx].url);
+         if (strlen(stations[current_station_idx].url) > 70) {
+            url_display[67] = '.'; url_display[68] = '.'; url_display[69] = '.'; url_display[70] = '\0';
+         }
+         draw_string(fb, width, height, url_display, 40, 125, theme->text_secondary);
+      } else {
+         int bar_width = width - 100;
+         int bar_x = 50;
+         int bar_y = 83;
+         draw_rect(fb, width, height, bar_x, bar_y, bar_width, 8, theme->border);
+
+         uint32_t play_rate = (playback_mode == PLAYBACK_FILE_WAV) ? wav_sample_rate : mp3_sample_rate;
+         uint64_t cur_sec = (play_rate > 0) ? pcm_samples_played / play_rate : 0;
+
+         uint64_t tot_sec = 0;
+         float progress = 0.0f;
+         if (playback_mode == PLAYBACK_FILE_WAV && wav_sample_rate > 0 && wav_channels > 0 && wav_bits > 0) {
+            uint64_t total_samples = file_total_bytes / ((uint32_t)wav_channels * (wav_bits / 8));
+            tot_sec = wav_sample_rate > 0 ? total_samples / wav_sample_rate : 0;
+            progress = total_samples > 0 ? (float)pcm_samples_played / total_samples : 0.0f;
+         } else {
+            tot_sec = mp3_total_seconds;
+            progress = tot_sec > 0 ? (float)cur_sec / tot_sec : 0.0f;
+         }
+         if (progress > 1.0f) progress = 1.0f;
+
+         draw_rect(fb, width, height, bar_x, bar_y, (int)(bar_width * progress), 8, theme->dial_accent);
+
+         char time_str[40];
+         snprintf(time_str, sizeof(time_str), "%02llu:%02llu / %02llu:%02llu",
+                  (unsigned long long)(cur_sec / 60), (unsigned long long)(cur_sec % 60),
+                  (unsigned long long)(tot_sec / 60), (unsigned long long)(tot_sec % 60));
+
+         char format_str[32];
+         if (playback_mode == PLAYBACK_FILE_WAV)
+            snprintf(format_str, sizeof(format_str), "WAV %uHz", wav_sample_rate);
+         else
+            snprintf(format_str, sizeof(format_str), "MP3 %ukbps", mp3_bitrate_bps / 1000);
+
+         draw_string(fb, width, height, time_str, bar_x, bar_y + 12, theme->text_secondary);
+         draw_string_with_shadow(fb, width, height, "LOCAL FILE PLAYBACK", 40, 35, theme->text_secondary, 0x000000);
+         draw_string_with_shadow(fb, width, height, file_display_name, 40, 50, theme->text_primary, 0x000000);
+         draw_string_with_shadow(fb, width, height, format_str, width - 160, 35, theme->dial_accent, 0x000000);
+
+         char url_display[80];
+         if (stations_is_dynamic && num_stations > 1) {
+            snprintf(url_display, sizeof(url_display), "TRACK %d/%d: %s", current_station_idx + 1, num_stations, file_path);
+         } else {
+            snprintf(url_display, sizeof(url_display), "FILE: %s", file_path);
+         }
+         if (strlen(url_display) > 70) {
+            url_display[67] = '.'; url_display[68] = '.'; url_display[69] = '.'; url_display[70] = '\0';
+         }
+         draw_string(fb, width, height, url_display, 40, 125, theme->text_secondary);
       }
-
-      float target_freq = stations[current_station_idx].frequency;
-      static float current_freq_pos = 98.0f;
-      current_freq_pos += (target_freq - current_freq_pos) * 0.08f;
-
-      int needle_x = 50 + (int)((current_freq_pos - 88.0f) * 27.0f);
-      draw_line(fb, width, height, needle_x, 75, needle_x, 98, 0xFF3333);
-      draw_line(fb, width, height, needle_x - 1, 75, needle_x - 1, 98, 0xFF3333);
-      draw_line(fb, width, height, needle_x + 1, 75, needle_x + 1, 98, 0xFF3333);
-
-      draw_rect(fb, width, height, needle_x - 2, 99, 5, 2, 0xFF5555);
-
-      char title_str[64];
-      sprintf(title_str, "RADIO PRESET %d/%d", current_station_idx + 1, num_stations);
-      draw_string_with_shadow(fb, width, height, title_str, 40, 35, theme->text_secondary, 0x000000);
-
-      draw_string_with_shadow(fb, width, height, stations[current_station_idx].name, 40, 50, theme->text_primary, 0x000000);
-
-      char freq_str[32];
-      sprintf(freq_str, "%.1f FM MHz", stations[current_station_idx].frequency);
-      draw_string_with_shadow(fb, width, height, freq_str, width - 150, 35, theme->dial_accent, 0x000000);
-
-      char url_display[80];
-      snprintf(url_display, sizeof(url_display), "URL: %s", stations[current_station_idx].url);
-      if (strlen(stations[current_station_idx].url) > 70) {
-         url_display[67] = '.';
-         url_display[68] = '.';
-         url_display[69] = '.';
-         url_display[70] = '\0';
-      }
-      draw_string(fb, width, height, url_display, 40, 125, theme->text_secondary);
 
       const char *status_text = "UNKNOWN";
       uint32_t status_color = 0xCCCCCC;
@@ -1019,12 +1256,16 @@ static void render_frame(uint32_t *fb, int width, int height) {
             status_color = 0xFFFF00;
             break;
          case STATUS_PLAYING:
-            status_text = "PLAYING ONLINE";
+            status_text = (playback_mode == PLAYBACK_RADIO) ? "PLAYING ONLINE" : "PLAYING FILE";
             status_color = 0x33FF33;
             break;
          case STATUS_ERROR:
-            status_text = "CONNECTION ERROR / OFFLINE";
+            status_text = (playback_mode == PLAYBACK_RADIO) ? "CONNECTION ERROR / OFFLINE" : "FILE ERROR";
             status_color = 0xFF3333;
+            break;
+         case STATUS_EOF:
+            status_text = "FILE FINISHED";
+            status_color = 0x888888;
             break;
       }
       draw_string_with_shadow(fb, width, height, "STATUS:", 40, 160, theme->text_secondary, 0x000000);
@@ -1034,6 +1275,9 @@ static void render_frame(uint32_t *fb, int width, int height) {
       int vol_bar_w = 80;
       draw_rect(fb, width, height, width - 120, 162, vol_bar_w, 4, theme->border);
       draw_rect(fb, width, height, width - 120, 162, (int)(vol_bar_w * current_volume), 4, theme->dial_accent);
+      
+      const char *controls_hint = (playback_mode == PLAYBACK_RADIO) ? "A: Play/Restart  B: Stop" : "A: Play/Restart  B: Stop  L/R: Seek";
+      draw_string(fb, width, height, controls_hint, 40, height - 30, theme->text_secondary);
    }
 
    int cy = ui_hidden ? (height / 2) : 250;
@@ -1227,12 +1471,12 @@ void retro_get_system_info(struct retro_system_info *info) {
    info->library_name     = "Radio";
    info->library_version  = "1.0";
    info->need_fullpath    = true;
-   info->valid_extensions = "m3u|txt";
+   info->valid_extensions = "m3u|txt|mp3|wav";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info) {
    info->timing.fps = 60.0;
-   info->timing.sample_rate = 44100.0;
+   info->timing.sample_rate = (playback_mode == PLAYBACK_FILE_WAV) ? (float)wav_sample_rate : 44100.0;
 
    info->geometry.base_width = frame_buf_width;
    info->geometry.base_height = frame_buf_height;
@@ -1292,6 +1536,21 @@ void retro_run(void) {
       check_variables();
    }
 
+   if (wav_rate_changed) {
+      wav_rate_changed = false;
+      struct retro_system_av_info av = {0};
+      retro_get_system_av_info(&av);
+      environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av);
+   }
+
+   if (core_status == STATUS_EOF) {
+      if (stations_is_dynamic && num_stations > 1) {
+         change_station(1);
+      } else {
+         stop_current_thread();
+      }
+   }
+
    input_poll_cb();
 
    bool press_up = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP);
@@ -1300,10 +1559,11 @@ void retro_run(void) {
    bool press_right = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT);
    bool press_l = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L);
    bool press_r = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R);
+   bool press_select = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT);
    bool press_a = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A);
    bool press_b = input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B);
 
-   if (press_up || press_down || press_left || press_right || press_l || press_r || press_a || press_b) {
+   if (press_up || press_down || press_left || press_right || press_l || press_r || press_select || press_a || press_b) {
       idle_frames = 0;
    } else {
       idle_frames++;
@@ -1317,10 +1577,7 @@ void retro_run(void) {
    if (press_down && !last_input_state[RETRO_DEVICE_ID_JOYPAD_DOWN]) {
       change_station(1);
    }
-   if (press_l && !last_input_state[RETRO_DEVICE_ID_JOYPAD_L]) {
-      visualizer_mode = (visualizer_mode + 1) % 2;
-   }
-   if (press_r && !last_input_state[RETRO_DEVICE_ID_JOYPAD_R]) {
+   if (press_select && !last_input_state[RETRO_DEVICE_ID_JOYPAD_SELECT]) {
       visualizer_mode = (visualizer_mode + 1) % 2;
    }
    if (press_a && !last_input_state[RETRO_DEVICE_ID_JOYPAD_A]) {
@@ -1330,13 +1587,72 @@ void retro_run(void) {
       pause_current_station();
    }
 
-   if (press_left) {
-      current_volume -= 0.015f;
-      if (current_volume < 0.0f) current_volume = 0.0f;
+   if (playback_mode != PLAYBACK_RADIO && file_total_bytes > 0) {
+      if (press_l) {
+         current_volume -= 0.015f;
+         if (current_volume < 0.0f) current_volume = 0.0f;
+      }
+      if (press_r) {
+         current_volume += 0.015f;
+         if (current_volume > 1.0f) current_volume = 1.0f;
+      }
+   } else {
+      if (press_l && !last_input_state[RETRO_DEVICE_ID_JOYPAD_L]) {
+         visualizer_mode = (visualizer_mode + 1) % 2;
+      }
+      if (press_r && !last_input_state[RETRO_DEVICE_ID_JOYPAD_R]) {
+         visualizer_mode = (visualizer_mode + 1) % 2;
+      }
    }
-   if (press_right) {
-      current_volume += 0.015f;
-      if (current_volume > 1.0f) current_volume = 1.0f;
+   
+   if (playback_mode == PLAYBACK_RADIO) {
+      if (press_left) {
+         current_volume -= 0.015f;
+         if (current_volume < 0.0f) current_volume = 0.0f;
+      }
+      if (press_right) {
+         current_volume += 0.015f;
+         if (current_volume > 1.0f) current_volume = 1.0f;
+      }
+   } else if (file_total_bytes > 0) {
+      uint64_t seek_amt = file_total_bytes / 20;
+      if (press_left && !last_input_state[RETRO_DEVICE_ID_JOYPAD_LEFT]) {
+         pthread_mutex_lock(&rb.mutex);
+         size_t unplayed = ring_buffer_read_avail(&rb);
+         pthread_mutex_unlock(&rb.mutex);
+         uint64_t actual_pos = (file_bytes_read > unplayed) ? (file_bytes_read - unplayed) : 0;
+         file_seek_target_bytes = (actual_pos > seek_amt) ? actual_pos - seek_amt : 0;
+         file_seek_requested = true;
+         mad_reset_decoder();
+         pthread_mutex_lock(&rb.mutex);
+         ring_buffer_clear(&rb);
+         pthread_mutex_unlock(&rb.mutex);
+         uint32_t sr = (playback_mode == PLAYBACK_FILE_WAV) ? wav_sample_rate : mp3_sample_rate;
+         if (playback_mode == PLAYBACK_FILE_WAV && wav_channels > 0 && wav_bits > 0) {
+            pcm_samples_played = file_seek_target_bytes / ((uint32_t)wav_channels * (wav_bits / 8));
+         } else if (mp3_bitrate_bps > 0 && sr > 0) {
+            pcm_samples_played = (file_seek_target_bytes * 8 / mp3_bitrate_bps) * sr;
+         }
+      }
+      if (press_right && !last_input_state[RETRO_DEVICE_ID_JOYPAD_RIGHT]) {
+         pthread_mutex_lock(&rb.mutex);
+         size_t unplayed = ring_buffer_read_avail(&rb);
+         pthread_mutex_unlock(&rb.mutex);
+         uint64_t actual_pos = (file_bytes_read > unplayed) ? (file_bytes_read - unplayed) : 0;
+         uint64_t new_pos = actual_pos + seek_amt;
+         file_seek_target_bytes = (new_pos < file_total_bytes) ? new_pos : file_total_bytes;
+         file_seek_requested = true;
+         mad_reset_decoder();
+         pthread_mutex_lock(&rb.mutex);
+         ring_buffer_clear(&rb);
+         pthread_mutex_unlock(&rb.mutex);
+         uint32_t sr = (playback_mode == PLAYBACK_FILE_WAV) ? wav_sample_rate : mp3_sample_rate;
+         if (playback_mode == PLAYBACK_FILE_WAV && wav_channels > 0 && wav_bits > 0) {
+            pcm_samples_played = file_seek_target_bytes / ((uint32_t)wav_channels * (wav_bits / 8));
+         } else if (mp3_bitrate_bps > 0 && sr > 0) {
+            pcm_samples_played = (file_seek_target_bytes * 8 / mp3_bitrate_bps) * sr;
+         }
+      }
    }
 
    last_input_state[RETRO_DEVICE_ID_JOYPAD_UP] = press_up;
@@ -1345,6 +1661,7 @@ void retro_run(void) {
    last_input_state[RETRO_DEVICE_ID_JOYPAD_RIGHT] = press_right;
    last_input_state[RETRO_DEVICE_ID_JOYPAD_L] = press_l;
    last_input_state[RETRO_DEVICE_ID_JOYPAD_R] = press_r;
+   last_input_state[RETRO_DEVICE_ID_JOYPAD_SELECT] = press_select;
    last_input_state[RETRO_DEVICE_ID_JOYPAD_A] = press_a;
    last_input_state[RETRO_DEVICE_ID_JOYPAD_B] = press_b;
 
@@ -1354,58 +1671,149 @@ void retro_run(void) {
    avail = ring_buffer_read_avail(&rb);
    pthread_mutex_unlock(&rb.mutex);
 
+   size_t mad_unconsumed = 0;
+   if (mad_initialized && mad_stream_state.next_frame != NULL &&
+       mad_stream_state.bufend > mad_stream_state.next_frame) {
+      mad_unconsumed = (size_t)(mad_stream_state.bufend - mad_stream_state.next_frame);
+   }
+   size_t pipeline_bytes = avail + mad_unconsumed + (mad_pcm_queue_len * 2);
+
    if (core_status == STATUS_BUFFERING) {
-      if (avail >= 65536) { 
+      size_t start_threshold = (playback_mode == PLAYBACK_RADIO) ? 65536 : 4096;
+      if (avail >= start_threshold) {
          core_status = STATUS_PLAYING;
       }
    } else if (core_status == STATUS_PLAYING) {
-      if (avail < 1024) { 
+      if (pipeline_bytes < 4096) {
          core_status = STATUS_BUFFERING;
       }
    }
 
    int16_t audio_out_buf[AUDIO_FRAMES_PER_TICK * 2];
-   float audio_float_buf[AUDIO_FRAMES_PER_TICK * 2];
 
    if (core_status == STATUS_PLAYING) {
-      if (!drmp3_initialized) {
-         if (drmp3_init(&mp3_decoder, drmp3_read_cb, NULL, &rb, NULL)) {
-            drmp3_initialized = true;
+      if (playback_mode == PLAYBACK_FILE_WAV) {
+         size_t bytes_per_frame = (wav_channels) * (wav_bits / 8);
+         size_t to_read = AUDIO_FRAMES_PER_TICK * bytes_per_frame;
+         
+         pthread_mutex_lock(&rb.mutex);
+         size_t rb_avail = ring_buffer_read_avail(&rb);
+         if (rb_avail < to_read) {
+            to_read = rb_avail - (rb_avail % bytes_per_frame);
+         }
+         uint8_t raw_wav[to_read + 1]; // +1 to avoid 0 size VLA
+         if (to_read > 0) ring_buffer_read(&rb, raw_wav, to_read);
+         pthread_mutex_unlock(&rb.mutex);
+         
+         size_t frames_copy = (to_read > 0 && bytes_per_frame > 0) ? (to_read / bytes_per_frame) : 0;
+         
+         for (size_t i = 0; i < frames_copy; i++) {
+             int16_t l = 0, r = 0;
+             if (wav_bits == 16) {
+                 int16_t *p = (int16_t*)raw_wav + i * wav_channels;
+                 l = p[0];
+                 r = (wav_channels > 1) ? p[1] : l;
+             } else if (wav_bits == 8) {
+                 uint8_t *p = (uint8_t*)raw_wav + i * wav_channels;
+                 l = (p[0] - 128) * 256;
+                 r = (wav_channels > 1) ? (p[1] - 128) * 256 : l;
+             }
+             audio_out_buf[i * 2] = l;
+             audio_out_buf[i * 2 + 1] = r;
+         }
+         if (frames_copy < AUDIO_FRAMES_PER_TICK) {
+             memset(audio_out_buf + frames_copy * 2, 0, (AUDIO_FRAMES_PER_TICK - frames_copy) * 2 * sizeof(int16_t));
+         }
+      } else {
+         if (!mad_initialized) {
+            mad_stream_init(&mad_stream_state);
+            mad_frame_init(&mad_frame_state);
+            mad_synth_init(&mad_synth_state);
+            mad_initialized = true;
+         }
+
+         {
+            size_t unconsumed = 0;
+            if (mad_stream_state.next_frame != NULL &&
+                mad_stream_state.bufend > mad_stream_state.next_frame) {
+               unconsumed = (size_t)(mad_stream_state.bufend - mad_stream_state.next_frame);
+               if (unconsumed > 0 && unconsumed <= MAD_INPUT_BUF_SIZE)
+                  memmove(mad_input_buf, mad_stream_state.next_frame, unconsumed);
+               else
+                  unconsumed = 0;
+            }
+            size_t space = MAD_INPUT_BUF_SIZE - unconsumed;
+            if (space > 0) {
+               pthread_mutex_lock(&rb.mutex);
+               size_t rb_avail = ring_buffer_read_avail(&rb);
+               size_t to_read  = rb_avail < space ? rb_avail : space;
+               if (to_read > 0)
+                  ring_buffer_read(&rb, mad_input_buf + unconsumed, to_read);
+               pthread_mutex_unlock(&rb.mutex);
+               unconsumed += to_read;
+            }
+            if (unconsumed > 0)
+               mad_stream_buffer(&mad_stream_state, mad_input_buf, unconsumed);
+         }
+
+         while (mad_pcm_queue_len + MAD_MAX_FRAME_SAMPLES * 2 <= MAD_PCM_QUEUE_MAX) {
+            if (mad_frame_decode(&mad_frame_state, &mad_stream_state) == -1) {
+               if (MAD_RECOVERABLE(mad_stream_state.error))
+                  continue;
+               break;
+            }
+            if (mad_frame_state.header.bitrate > 0 && mp3_total_seconds == 0)
+               mp3_bitrate_bps = mad_frame_state.header.bitrate;
+            if (mad_frame_state.header.samplerate > 0)
+               mp3_sample_rate = mad_frame_state.header.samplerate;
+            if (mp3_total_seconds == 0 && mp3_bitrate_bps > 0 && file_total_bytes > 0)
+               mp3_total_seconds = (file_total_bytes * 8) / mp3_bitrate_bps;
+            mad_synth_frame(&mad_synth_state, &mad_frame_state);
+            struct mad_pcm *pcm = &mad_synth_state.pcm;
+            for (unsigned s = 0; s < pcm->length; s++) {
+               mad_fixed_t l = pcm->samples[0][s];
+               mad_fixed_t r = (pcm->channels > 1) ? pcm->samples[1][s] : l;
+               if (l >=  MAD_F_ONE) l =  MAD_F_ONE - 1;
+               if (l <= -MAD_F_ONE) l = -MAD_F_ONE;
+               if (r >=  MAD_F_ONE) r =  MAD_F_ONE - 1;
+               if (r <= -MAD_F_ONE) r = -MAD_F_ONE;
+               mad_pcm_queue[mad_pcm_queue_len++] = (int16_t)(l >> (MAD_F_FRACBITS - 15));
+               mad_pcm_queue[mad_pcm_queue_len++] = (int16_t)(r >> (MAD_F_FRACBITS - 15));
+            }
+         }
+
+         size_t frames_avail = mad_pcm_queue_len / 2;
+         size_t frames_copy  = frames_avail < AUDIO_FRAMES_PER_TICK
+                               ? frames_avail : AUDIO_FRAMES_PER_TICK;
+         memcpy(audio_out_buf, mad_pcm_queue, frames_copy * 2 * sizeof(int16_t));
+         size_t remaining = mad_pcm_queue_len - frames_copy * 2;
+         if (remaining > 0) {
+            memmove(mad_pcm_queue, mad_pcm_queue + frames_copy * 2,
+                    remaining * sizeof(int16_t));
+         }
+         mad_pcm_queue_len = remaining;
+         if (frames_copy < AUDIO_FRAMES_PER_TICK) {
+            memset(audio_out_buf + frames_copy * 2, 0,
+                   (AUDIO_FRAMES_PER_TICK - frames_copy) * 2 * sizeof(int16_t));
          }
       }
 
-      size_t decoded = 0;
-      if (drmp3_initialized) {
-         decoded = (size_t)drmp3_read_f32(&mp3_decoder, AUDIO_FRAMES_PER_TICK, audio_float_buf);
-      }
-
-      if (decoded < AUDIO_FRAMES_PER_TICK) {
-         memset(audio_float_buf + decoded * 2, 0, (AUDIO_FRAMES_PER_TICK - decoded) * 2 * sizeof(float));
-      }
-
       for (size_t i = 0; i < AUDIO_FRAMES_PER_TICK; i++) {
-         float fl = audio_float_buf[i * 2];
-         float fr = audio_float_buf[i * 2 + 1];
-
-         fl *= current_volume;
-         fr *= current_volume;
-
-         if (fl > 1.0f) fl = 1.0f;
-         else if (fl < -1.0f) fl = -1.0f;
-         if (fr > 1.0f) fr = 1.0f;
-         else if (fr < -1.0f) fr = -1.0f;
-
-         audio_out_buf[i * 2] = (int16_t)(fl * 32767.0f);
+         float fl = (float)audio_out_buf[i * 2]     / 32767.0f * current_volume;
+         float fr = (float)audio_out_buf[i * 2 + 1] / 32767.0f * current_volume;
+         if (fl >  1.0f) fl =  1.0f; else if (fl < -1.0f) fl = -1.0f;
+         if (fr >  1.0f) fr =  1.0f; else if (fr < -1.0f) fr = -1.0f;
+         audio_out_buf[i * 2]     = (int16_t)(fl * 32767.0f);
          audio_out_buf[i * 2 + 1] = (int16_t)(fr * 32767.0f);
-
          float mono = (fl + fr) * 0.5f;
          vis_history[vis_history_index] = mono;
          vis_history_index = (vis_history_index + 1) % VIS_SIZE;
       }
 
       audio_batch_cb(audio_out_buf, AUDIO_FRAMES_PER_TICK);
+      if (playback_mode != PLAYBACK_RADIO)
+         pcm_samples_played += AUDIO_FRAMES_PER_TICK;
    } else {
-      
       memset(audio_out_buf, 0, AUDIO_FRAMES_PER_TICK * 2 * sizeof(int16_t));
       audio_batch_cb(audio_out_buf, AUDIO_FRAMES_PER_TICK);
 
@@ -1444,17 +1852,30 @@ static void parse_playlist_line(char *line, float *next_freq, char *pending_name
       if (pending_name[0] != '\0') {
          stations[num_stations].name = strdup(pending_name);
       } else {
-         char host[256];
-         int port;
-         char path_url[256];
-         parse_url(ptr, host, &port, path_url);
-         char auto_name[256];
-         sprintf(auto_name, "Station: %s", host);
-         stations[num_stations].name = strdup(auto_name);
+         const char *ext = strrchr(ptr, '.');
+         bool is_local_file = (ptr[0] == '/') || (ptr[1] == ':') || 
+                              (ext && (strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".wav") == 0));
+         if (is_local_file) {
+            const char *base = strrchr(ptr, '/');
+            if (!base) base = strrchr(ptr, '\\');
+            if (base) base++; else base = ptr;
+            stations[num_stations].name = strdup(base);
+         } else {
+            char host[256];
+            int port;
+            char path_url[256];
+            parse_url(ptr, host, &port, path_url);
+            char auto_name[256];
+            sprintf(auto_name, "Station: %s", host);
+            stations[num_stations].name = strdup(auto_name);
+         }
       }
 
       char url_buf[512];
-      if (strstr(ptr, "://") == NULL) {
+      const char *ext = strrchr(ptr, '.');
+      bool is_local_file = (ptr[0] == '/') || (ptr[1] == ':') || 
+                           (ext && (strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".wav") == 0));
+      if (strstr(ptr, "://") == NULL && !is_local_file) {
          snprintf(url_buf, sizeof(url_buf), "http://%s", ptr);
       } else {
          snprintf(url_buf, sizeof(url_buf), "%s", ptr);
@@ -1612,10 +2033,21 @@ bool retro_load_game(const struct retro_game_info *game) {
    num_stations = 0;
    stations_is_dynamic = false;
 
-   
    if (game && game->path && game->path[0] != '\0') {
-      if (load_playlist_file(game->path)) {
+      const char *ext = strrchr(game->path, '.');
+      if (ext && (strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".wav") == 0)) {
+         stations[0].url = strdup(game->path);
+         const char *base = strrchr(game->path, '/');
+         if (!base) base = strrchr(game->path, '\\');
+         if (base) base++; else base = game->path;
+         stations[0].name = strdup(base);
+         stations[0].frequency = 88.1f;
+         num_stations = 1;
          stations_is_dynamic = true;
+      } else {
+         if (load_playlist_file(game->path)) {
+            stations_is_dynamic = true;
+         }
       }
    }
 
@@ -1675,7 +2107,7 @@ bool retro_load_game(const struct retro_game_info *game) {
 
    current_station_idx = 0;
    check_variables();
-   start_connection_thread(stations[current_station_idx].url);
+   play_current_station();
 
    return true;
 }
