@@ -1183,9 +1183,9 @@ static void render_frame(uint32_t *fb, int width, int height) {
    }
 
    if (!ui_hidden) {
-      draw_line(fb, width, height, 30, height - 40, width - 30, height - 40, theme->border);
-      draw_string(fb, width, height, "UP/DOWN: Select Preset  |  LEFT/RIGHT: Volume  |  L1/R1: Visualizer Mode", 40, height - 32, theme->text_secondary);
-      draw_string(fb, width, height, "A: Connect/Play  |  B: Pause/Stop", 40, height - 22, theme->text_secondary);
+      draw_line(fb, width, height, 30, height - 44, width - 30, height - 44, theme->border);
+      draw_string(fb, width, height, "UP/DOWN: Select Preset  |  LEFT/RIGHT: Volume  |  L1/R1: Visualizer Mode", 40, height - 34, theme->text_secondary);
+      draw_string(fb, width, height, "A: Connect/Play  |  B: Pause/Stop", 40, height - 20, theme->text_secondary);
    }
 }
 
