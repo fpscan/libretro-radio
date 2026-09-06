@@ -1,11 +1,11 @@
 # Software Information
 display_name = "Internet Radio (Radio)"
 authors = "fpscan gadsby"
-supported_extensions = "m3u|txt"
+supported_extensions = "m3u|txt|mp3|wav"
 corename = "Radio"
 categories = "Utility"
 license = "MIT"
-display_version = "1.0"
+display_version = "1.1"
 
 # Hardware Information
 systemname = "Internet Radio Player"
@@ -13,4 +13,4 @@ systemid = "internet_radio"
 supports_no_game = "true"
 
 # Description
-description = "Radio core that streams radio channels over network."
+description = "Radio core that streams radio channels over network and plays local MP3/WAV audio files."
