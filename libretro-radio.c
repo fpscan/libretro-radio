@@ -7,16 +7,17 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
-#include <sys/select.h>
 #include <time.h>
 
 #ifdef _WIN32
+/* winsock2.h declares select() and fd_set; there is no <sys/select.h> here */
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #define close closesocket
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 #else
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -1879,6 +1880,11 @@ static void render_frame(uint32_t *fb, int width, int height) {
 }
 
 void retro_init(void) {
+#ifdef _WIN32
+   /* Winsock hands out no sockets at all before this */
+   WSADATA wsa_data;
+   WSAStartup(MAKEWORD(2, 2), &wsa_data);
+#endif
    frame_buf = (uint32_t *)calloc(frame_buf_width * frame_buf_height, sizeof(uint32_t));
    ring_buffer_init(&rb, 524288);
    pcm_fifo_init(&pcm_queue, PCM_QUEUE_SIZE);
@@ -1929,6 +1935,9 @@ void retro_init(void) {
 
 void retro_deinit(void) {
    stop_current_thread();
+#ifdef _WIN32
+   WSACleanup();
+#endif
    ring_buffer_free(&rb);
    pcm_fifo_free(&pcm_queue);
 

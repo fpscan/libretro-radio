@@ -70,7 +70,10 @@ else ifeq ($(platform), ios-arm64)
    SHARED := -dynamiclib
    LIBS += -lm -lpthread
    FPM_DEFINE := -DFPM_64BIT
-   MINVERSION := -miphoneos-version-min=11.0
+   # 12.0 and up gets an LC_BUILD_VERSION load command; below that the
+   # linker emits LC_VERSION_MIN_IPHONEOS, which the buildbot's platform check
+   # (vtool -show | grep IOS) does not recognise
+   MINVERSION := -miphoneos-version-min=12.0
    IOSSDK := $(shell xcrun -sdk iphoneos -show-sdk-path)
    CC := cc -arch arm64 -isysroot $(IOSSDK)
    CFLAGS += $(MINVERSION)
